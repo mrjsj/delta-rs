@@ -36,8 +36,10 @@ use std::time::Instant;
 use async_trait::async_trait;
 use datafusion::datasource::provider_as_source;
 use datafusion::error::Result as DataFusionResult;
+use datafusion::functions_aggregate::expr_fn::{sum, count};
 use datafusion::execution::context::SessionConfig;
 use datafusion::execution::session_state::SessionStateBuilder;
+use datafusion::functions_window::expr_fn::row_number;
 use datafusion::logical_expr::build_join_schema;
 use datafusion::physical_plan::metrics::MetricBuilder;
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
@@ -50,9 +52,11 @@ use datafusion_common::tree_node::{Transformed, TreeNode};
 use datafusion_common::{Column, DFSchema, ScalarValue, TableReference};
 use datafusion_expr::{col, conditional_expressions::CaseBuilder, lit, when, Expr, JoinType};
 use datafusion_expr::{
-    Extension, LogicalPlan, LogicalPlanBuilder, UserDefinedLogicalNode, UNNAMED_TABLE,
+    Extension, LogicalPlan, LogicalPlanBuilder, UserDefinedLogicalNode, UNNAMED_TABLE
 };
 
+use datafusion_common::utils::expr::COUNT_STAR_EXPANSION;
+use datafusion::functions::core::expr_fn::{coalesce};
 use filter::try_construct_early_filter;
 use futures::future::BoxFuture;
 use itertools::Itertools;
@@ -87,6 +91,8 @@ mod filter;
 
 const SOURCE_COLUMN: &str = "__delta_rs_source";
 const TARGET_COLUMN: &str = "__delta_rs_target";
+const TARGET_ROW_ID_COLUMN: &str = "__delta_rs_target_row_id";
+const TARGET_MATCHED_ROW_COUNT_COLUMN: &str = "__delta_rs_target_matched_row_count";
 
 const OPERATION_COLUMN: &str = "__delta_rs_operation";
 const DELETE_COLUMN: &str = "__delta_rs_delete";
@@ -828,9 +834,48 @@ async fn execute(
         }),
     });
     let target = DataFrame::new(state.clone(), target);
-    let target = target.with_column(TARGET_COLUMN, lit(true))?;
+    let target = target.with_column(TARGET_COLUMN, lit(true))?.with_column(TARGET_ROW_ID_COLUMN, row_number())?;
 
-    let join = source.join(target, JoinType::Full, &[], &[], Some(predicate.clone()))?;
+    let join = target.join(source, JoinType::Full, &[], &[], Some(predicate.clone()))?;
+    
+    let matched_row_counts = join.clone().filter(predicate.clone().is_true())?.aggregate(vec![col(TARGET_ROW_ID_COLUMN)], vec![count(predicate.clone()).alias(TARGET_MATCHED_ROW_COUNT_COLUMN)])?;
+    matched_row_counts.clone().show().await?;
+    let dd = matched_row_counts.clone().limit(0, Some(1))?;
+    
+    let matched_row_count = matched_row_counts.filter(col(TARGET_MATCHED_ROW_COUNT_COLUMN).gt(lit(1)))?; //?.count().await?;
+    matched_row_count.clone().show().await?;
+    // println!("matched_row_count: {:?}", matched_row_count);
+    let match_result = matched_row_count.clone()
+        .clone()
+        .aggregate(
+            vec![],
+            vec![
+            count(lit(1)).alias("multiple_match_count"),
+            sum(col(TARGET_MATCHED_ROW_COUNT_COLUMN)).alias("multiple_match_sum")
+        ])?
+        .select(vec![
+            coalesce(vec![col("multiple_match_count"), lit(0)]),
+            coalesce(vec![col("multiple_match_sum"), lit(0)])
+        ])?
+        .collect()
+        .await?;
+
+    matched_row_count
+        .clone()
+        .aggregate(
+            vec![],
+            vec![
+            count(lit(1)).alias("multiple_match_count"),
+            sum(col(TARGET_MATCHED_ROW_COUNT_COLUMN)).alias("multiple_match_sum")
+        ])?
+        .select(vec![
+            coalesce(vec![col("multiple_match_count"), lit(0)]),
+            coalesce(vec![col("multiple_match_sum"), lit(0)])
+        ])?
+        .show().await?;
+    let multiple_match_count = match_result[0].column(0).as_any().downcast_ref::<arrow_array::Int64Array>().unwrap().value(0) as usize;
+    let multiple_match_sum = match_result[0].column(1).as_any().downcast_ref::<arrow_array::Int64Array>().unwrap().value(0) as usize;
+
     let join_schema_df = join.schema().to_owned();
 
     let match_operations: Vec<MergeOperation> = match_operations
@@ -1012,6 +1057,22 @@ async fn execute(
     let mut copy_when = Vec::with_capacity(ops.len());
     let mut copy_then = Vec::with_capacity(ops.len());
 
+    let only_deletes = ops.iter().all(|(_, r#type)| matches!(
+        r#type,
+        OperationType::Delete | OperationType::SourceDelete
+    ));
+
+    let mut multiple_match_delete_only_overcount = 0;
+    if multiple_match_count > 0 {
+
+        multiple_match_delete_only_overcount = multiple_match_sum - multiple_match_count;
+        if !only_deletes {
+            return Err(DeltaTableError::Generic(format!(
+                "Merge operation would produce duplicate updates. Source data contains duplicate values for merge predicate columns."
+            )));
+        }
+    }
+
     for (idx, (_operations, r#type)) in ops.iter().enumerate() {
         let op = idx as i32;
 
@@ -1059,6 +1120,7 @@ async fn execute(
             .otherwise(lit(false))?,
         );
     }
+
 
     fn build_case(when: Vec<Expr>, then: Vec<Expr>) -> DataFusionResult<Expr> {
         CaseBuilder::new(
@@ -1129,7 +1191,7 @@ async fn execute(
         // Create a dataframe containing the CDC deletes which are present at this point
         change_data.push(
             operation_count
-                .clone()
+        .clone()
                 .filter(col(DELETE_COLUMN))?
                 .select(write_projection.clone())?
                 .with_column(crate::operations::cdc::CDC_COLUMN_NAME, lit("delete"))?,
@@ -1222,7 +1284,7 @@ async fn execute(
         writer_stats_config.clone(),
         None,
     )
-    .await?;
+        .await?;
 
     if should_cdc && !change_data.is_empty() {
         let mut df = change_data
@@ -1278,7 +1340,7 @@ async fn execute(
     metrics.num_source_rows = get_metric(&source_count_metrics, SOURCE_COUNT_METRIC);
     metrics.num_target_rows_inserted = get_metric(&target_count_metrics, TARGET_INSERTED_METRIC);
     metrics.num_target_rows_updated = get_metric(&target_count_metrics, TARGET_UPDATED_METRIC);
-    metrics.num_target_rows_deleted = get_metric(&target_count_metrics, TARGET_DELETED_METRIC);
+    metrics.num_target_rows_deleted = get_metric(&target_count_metrics, TARGET_DELETED_METRIC) - multiple_match_delete_only_overcount;
     metrics.num_target_rows_copied = get_metric(&target_count_metrics, TARGET_COPY_METRIC);
     metrics.num_output_rows = metrics.num_target_rows_inserted
         + metrics.num_target_rows_updated
@@ -1337,7 +1399,7 @@ fn remove_table_alias(expr: Expr, table_alias: &str) -> Expr {
         },
         _ => Ok(Transformed::no(expr)),
     })
-    .unwrap()
+        .unwrap()
     .data
 }
 
@@ -1714,6 +1776,26 @@ mod tests {
             .unwrap();
 
         assert_merge(table, metrics).await;
+    }
+
+    #[tokio::test]
+    async fn test_merge_fails_if_multiple_matches() {
+
+        let (table, source) = setup().await;
+        let source_with_duplicates = source.clone().union(source).unwrap();
+        let res = DeltaOps(table)
+            .merge(source_with_duplicates, col("target.id").eq(col("source.id")))
+            .with_source_alias("source")
+            .with_target_alias("target")
+            .when_matched_update(|update|{
+                update
+                    .update("value", "target.value")
+                    .update("modified", "target.modified")
+            })
+            .unwrap()
+            .await;
+        // assert!(res.is_err());
+        assert!(res.is_err());
     }
 
     #[tokio::test]
