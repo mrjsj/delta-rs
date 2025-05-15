@@ -1093,25 +1093,14 @@ async fn execute(
         Ok(predicates)
     }
 
-    let match_operations = update_case(
-        match_operations,
-        &mut ops,
-        &mut when_expr,
-        &mut then_expr,
-        &matched,
-    )?;
-
     // If there is only one `when matched operation`
     // and it's a `delete`
     // and it does not have a predicate.
-    let is_only_one_unconditional_delete = match match_operations.as_slice() {
-        [op] if op.action_type == "delete" && op.predicate == None => true,
-        _ => false,
-    };
+    let is_only_one_unconditional_delete = matches!(match_operations.as_slice(), [op] if matches!(op.r#type, OperationType::Delete) && op.predicate.is_none());
 
     // Multiple matches are not ambiguous when there is only one unconditional delete
     if multiple_match_count > 0 && !is_only_one_unconditional_delete {
-        return Err(DeltaTableError::Generic(format!("Cannot perform MERGE as multiple source rows matched and attempted to update the same target row in the Delta table.")));
+        return Err(DeltaTableError::Generic("Cannot perform MERGE as multiple source rows matched and attempted to update the same target row in the Delta table.".to_string()));
     }
 
     // We over-count num_target_rows_deleted when there are multiple matches;
@@ -1121,6 +1110,14 @@ async fn execute(
     } else {
         0
     };
+
+    let match_operations = update_case(
+        match_operations,
+        &mut ops,
+        &mut when_expr,
+        &mut then_expr,
+        &matched,
+    )?;
 
     let not_match_target_operations = update_case(
         not_match_target_operations,
