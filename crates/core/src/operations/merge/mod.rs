@@ -39,6 +39,9 @@ use datafusion::datasource::provider_as_source;
 use datafusion::error::Result as DataFusionResult;
 use datafusion::execution::context::SessionConfig;
 use datafusion::execution::session_state::SessionStateBuilder;
+use datafusion::functions::core::expr_fn::coalesce;
+use datafusion::functions_aggregate::expr_fn::{count, sum};
+use datafusion::functions_window::expr_fn::row_number;
 use datafusion::logical_expr::build_join_schema;
 use datafusion::optimizer::simplify_expressions::ExprSimplifier;
 use datafusion::physical_plan::metrics::MetricBuilder;
@@ -96,6 +99,8 @@ mod filter;
 
 const SOURCE_COLUMN: &str = "__delta_rs_source";
 const TARGET_COLUMN: &str = "__delta_rs_target";
+const TARGET_ROW_ID_COLUMN: &str = "__delta_rs_target_row_id";
+const TARGET_MATCHED_ROW_COUNT_COLUMN: &str = "__delta_rs_target_matched_row_count";
 
 const OPERATION_COLUMN: &str = "__delta_rs_operation";
 const DELETE_COLUMN: &str = "__delta_rs_delete";
@@ -908,9 +913,56 @@ async fn execute(
         }),
     });
     let target = DataFrame::new(state.clone(), target);
-    let target = target.with_column(TARGET_COLUMN, lit(true))?;
+    let target = target
+        .with_column(TARGET_COLUMN, lit(true))?
+        .with_column(TARGET_ROW_ID_COLUMN, row_number())?;
 
     let join = source.join(target, JoinType::Full, &[], &[], Some(predicate.clone()))?;
+
+    // Calculate the frequency of matches per source row
+    let with_matched_row_count = join.clone().filter(predicate.clone())?.aggregate(
+        vec![col(TARGET_ROW_ID_COLUMN)],
+        vec![count(predicate.clone()).alias(TARGET_MATCHED_ROW_COUNT_COLUMN)],
+    )?;
+
+    // Calculate the count of distinct matches, and the total sum of matches
+    // These are used to correctly calculate the operation metrics (i.e. num_target_rows_deleted)
+    let multiple_match_result = with_matched_row_count
+        .filter(col(TARGET_MATCHED_ROW_COUNT_COLUMN).gt(lit(1)))?
+        .aggregate(
+            vec![],
+            vec![
+                count(lit(1)).alias("multiple_match_count"),
+                sum(col(TARGET_MATCHED_ROW_COUNT_COLUMN)).alias("multiple_match_sum"),
+            ],
+        )?
+        .select(vec![
+            coalesce(vec![col("multiple_match_count"), lit(0)]).alias("multiple_match_count"),
+            coalesce(vec![col("multiple_match_sum"), lit(0)]).alias("multiple_match_sum"),
+        ])?
+        .collect()
+        .await?;
+
+    let multiple_match_count = multiple_match_result
+        .first()
+        .unwrap()
+        .column_by_name("multiple_match_count")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow_array::Int64Array>()
+        .unwrap()
+        .value(0) as usize;
+
+    let multiple_match_sum = multiple_match_result
+        .first()
+        .unwrap()
+        .column_by_name("multiple_match_sum")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow_array::Int64Array>()
+        .unwrap()
+        .value(0) as usize;
+
     let join_schema_df = join.schema().to_owned();
 
     let match_operations: Vec<MergeOperation> = match_operations
@@ -1048,6 +1100,27 @@ async fn execute(
         &mut then_expr,
         &matched,
     )?;
+
+    // If there is only one `when matched operation` 
+    // and it's a `delete` 
+    // and it does not have a predicate.
+    let is_only_one_unconditional_delete = match match_operations.as_slice() {
+        [op] if op.action_type == "delete" && op.predicate == None => true,
+        _ => false,
+    };
+    
+    // Multiple matches are not ambiguous when there is only one unconditional delete
+    if multiple_match_count > 0 && !is_only_one_unconditional_delete {
+        return Err(DeltaTableError::Generic(format!("Cannot perform MERGE as multiple source rows matched and attempted to update the same target row in the Delta table.")));
+    }
+
+    // We over-count num_target_rows_deleted when there are multiple matches;
+    // this is the amount of the overcount, so we can subtract it to get a correct final metric.
+    let multiple_match_delete_only_overcount = if multiple_match_count > 0 {
+        multiple_match_sum - multiple_match_count
+    } else {
+        0
+    };    
 
     let not_match_target_operations = update_case(
         not_match_target_operations,
@@ -1425,7 +1498,7 @@ async fn execute(
     metrics.num_source_rows = get_metric(&source_count_metrics, SOURCE_COUNT_METRIC);
     metrics.num_target_rows_inserted = get_metric(&target_count_metrics, TARGET_INSERTED_METRIC);
     metrics.num_target_rows_updated = get_metric(&target_count_metrics, TARGET_UPDATED_METRIC);
-    metrics.num_target_rows_deleted = get_metric(&target_count_metrics, TARGET_DELETED_METRIC);
+    metrics.num_target_rows_deleted = get_metric(&target_count_metrics, TARGET_DELETED_METRIC) - multiple_match_delete_only_overcount;
     metrics.num_target_rows_copied = get_metric(&target_count_metrics, TARGET_COPY_METRIC);
     metrics.num_output_rows = metrics.num_target_rows_inserted
         + metrics.num_target_rows_updated
