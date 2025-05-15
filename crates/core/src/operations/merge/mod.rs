@@ -4269,4 +4269,48 @@ mod tests {
         "+----+-------+------------+--------------+-----------------+",
         ], &batches }
     }
+
+    #[tokio::test]
+    async fn test_merge_fails_if_multiple_matches() {
+        let (table, source) = setup().await;
+
+        let source_with_duplicates = source.clone().union(source).unwrap();
+
+        let res = DeltaOps(table)
+            .merge(
+                source_with_duplicates,
+                col("target.id").eq(col("source.id")),
+            )
+            .with_source_alias("source")
+            .with_target_alias("target")
+            .when_matched_update(|update| {
+                update
+                    .update("value", "target.value")
+                    .update("modified", "target.modified")
+            })
+            .unwrap()
+            .await;
+
+        assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_merge_does_not_fail_if_multiple_matches_and_when_matched_delete_only() {
+        let (table, source) = setup().await;
+
+        let source_with_duplicates = source.clone().union(source).unwrap();
+
+        let res = DeltaOps(table)
+            .merge(
+                source_with_duplicates,
+                col("target.id").eq(col("source.id")),
+            )
+            .with_source_alias("source")
+            .with_target_alias("target")
+            .when_matched_delete(|delete|delete)
+            .unwrap()
+            .await;
+
+        assert!(!res.is_err());
+    }    
 }
