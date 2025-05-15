@@ -1101,14 +1101,14 @@ async fn execute(
         &matched,
     )?;
 
-    // If there is only one `when matched operation` 
-    // and it's a `delete` 
+    // If there is only one `when matched operation`
+    // and it's a `delete`
     // and it does not have a predicate.
     let is_only_one_unconditional_delete = match match_operations.as_slice() {
         [op] if op.action_type == "delete" && op.predicate == None => true,
         _ => false,
     };
-    
+
     // Multiple matches are not ambiguous when there is only one unconditional delete
     if multiple_match_count > 0 && !is_only_one_unconditional_delete {
         return Err(DeltaTableError::Generic(format!("Cannot perform MERGE as multiple source rows matched and attempted to update the same target row in the Delta table.")));
@@ -1120,7 +1120,7 @@ async fn execute(
         multiple_match_sum - multiple_match_count
     } else {
         0
-    };    
+    };
 
     let not_match_target_operations = update_case(
         not_match_target_operations,
@@ -1498,7 +1498,8 @@ async fn execute(
     metrics.num_source_rows = get_metric(&source_count_metrics, SOURCE_COUNT_METRIC);
     metrics.num_target_rows_inserted = get_metric(&target_count_metrics, TARGET_INSERTED_METRIC);
     metrics.num_target_rows_updated = get_metric(&target_count_metrics, TARGET_UPDATED_METRIC);
-    metrics.num_target_rows_deleted = get_metric(&target_count_metrics, TARGET_DELETED_METRIC) - multiple_match_delete_only_overcount;
+    metrics.num_target_rows_deleted = get_metric(&target_count_metrics, TARGET_DELETED_METRIC)
+        - multiple_match_delete_only_overcount;
     metrics.num_target_rows_copied = get_metric(&target_count_metrics, TARGET_COPY_METRIC);
     metrics.num_output_rows = metrics.num_target_rows_inserted
         + metrics.num_target_rows_updated
@@ -4380,10 +4381,10 @@ mod tests {
             )
             .with_source_alias("source")
             .with_target_alias("target")
-            .when_matched_delete(|delete|delete)
+            .when_matched_delete(|delete| delete)
             .unwrap()
             .await;
 
         assert!(!res.is_err());
-    }    
+    }
 }
