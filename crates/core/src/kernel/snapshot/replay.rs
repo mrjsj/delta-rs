@@ -13,6 +13,7 @@ use arrow_schema::{
     SchemaRef as ArrowSchemaRef,
 };
 use arrow_select::filter::filter_record_batch;
+use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::expressions::Scalar;
 use delta_kernel::schema::DataType;
 use delta_kernel::schema::PrimitiveType;
@@ -53,7 +54,7 @@ impl<'a, S> ReplayStream<'a, S> {
         snapshot: &Snapshot,
         visitors: &'a mut Vec<Box<dyn ReplayVisitor>>,
     ) -> DeltaResult<Self> {
-        let stats_schema = Arc::new((&snapshot.stats_schema(None)?).try_into()?);
+        let stats_schema = Arc::new((&snapshot.stats_schema(None)?).try_into_arrow()?);
         let partitions_schema = snapshot.partitions_schema(None)?.map(Arc::new);
         let mapper = Arc::new(LogMapper {
             stats_schema,
@@ -82,7 +83,7 @@ impl LogMapper {
         table_schema: Option<&StructType>,
     ) -> DeltaResult<Self> {
         Ok(Self {
-            stats_schema: Arc::new((&snapshot.stats_schema(table_schema)?).try_into()?),
+            stats_schema: Arc::new((&snapshot.stats_schema(table_schema)?).try_into_arrow()?),
             partitions_schema: snapshot.partitions_schema(table_schema)?.map(Arc::new),
             config: snapshot.config.clone(),
         })
@@ -124,7 +125,7 @@ fn map_batch(
 }
 
 /// parse the serialized stats in the  `add.stats` column in the files batch
-/// and add a new column `stats_parsed` containing the the parsed stats.
+/// and add a new column `stats_parsed` containing the parsed stats.
 fn parse_stats(
     batch: RecordBatch,
     stats_schema: ArrowSchemaRef,
@@ -143,6 +144,7 @@ fn parse_partitions(batch: RecordBatch, partition_schema: &StructType) -> DeltaR
             "No partitionValues column found in files batch. This is unexpected.",
         ),
     )?;
+    let num_rows = batch.num_rows();
 
     let mut values = partition_schema
         .fields()
@@ -310,15 +312,16 @@ fn parse_partitions(batch: RecordBatch, partition_schema: &StructType) -> DeltaR
 
     insert_field(
         batch,
-        StructArray::try_new(
+        StructArray::try_new_with_length(
             Fields::from(
                 partition_schema
                     .fields()
-                    .map(|f| f.try_into())
+                    .map(|f| f.try_into_arrow())
                     .collect::<Result<Vec<ArrowField>, _>>()?,
             ),
             columns,
             None,
+            num_rows,
         )?,
         "partitionValues_parsed",
     )
@@ -328,6 +331,7 @@ fn insert_field(batch: RecordBatch, array: StructArray, name: &str) -> DeltaResu
     let schema = batch.schema();
     let add_col = ex::extract_and_cast::<StructArray>(&batch, "add")?;
     let (add_idx, _) = schema.column_with_name("add").unwrap();
+    let num_rows = batch.num_rows();
 
     let add_type = add_col
         .fields()
@@ -339,7 +343,7 @@ fn insert_field(batch: RecordBatch, array: StructArray, name: &str) -> DeltaResu
             true,
         ))))
         .collect_vec();
-    let new_add = Arc::new(StructArray::try_new(
+    let new_add = Arc::new(StructArray::try_new_with_length(
         add_type.clone().into(),
         add_col
             .columns()
@@ -348,6 +352,7 @@ fn insert_field(batch: RecordBatch, array: StructArray, name: &str) -> DeltaResu
             .chain(std::iter::once(Arc::new(array) as ArrayRef))
             .collect(),
         add_col.nulls().cloned(),
+        num_rows,
     )?);
     let new_add_field = Arc::new(ArrowField::new(
         "add",
@@ -602,35 +607,35 @@ pub(super) mod tests {
     use std::sync::Arc;
 
     use arrow_select::concat::concat_batches;
+    use delta_kernel::engine::arrow_conversion::TryIntoKernel;
     use delta_kernel::schema::DataType;
-    use deltalake_test::utils::*;
     use futures::TryStreamExt;
     use object_store::path::Path;
 
-    use super::super::{log_segment::LogSegment, partitions_schema, stats_schema};
+    use super::super::{log_segment::LogSegment, partitions_schema};
     use super::*;
+    use crate::kernel::arrow::engine_ext::stats_schema_from_config;
     use crate::kernel::transaction::CommitData;
     use crate::kernel::{models::ActionType, StructType};
     use crate::protocol::DeltaOperation;
     use crate::table::config::TableConfig;
-    use crate::test_utils::{ActionFactory, TestResult, TestSchemas};
+    use crate::test_utils::{ActionFactory, TestResult, TestSchemas, TestTables};
 
-    pub(crate) async fn test_log_replay(context: &IntegrationContext) -> TestResult {
+    pub(crate) async fn test_log_replay() -> TestResult {
         let log_schema = Arc::new(StructType::new(vec![
             ActionType::Add.schema_field().clone(),
             ActionType::Remove.schema_field().clone(),
         ]));
 
-        let store = context
-            .table_builder(TestTables::SimpleWithCheckpoint)
-            .build_storage()?
-            .object_store(None);
+        let log_store = TestTables::SimpleWithCheckpoint
+            .table_builder()
+            .build_storage()?;
 
-        let segment = LogSegment::try_new(&Path::default(), Some(9), store.as_ref()).await?;
+        let segment = LogSegment::try_new(&log_store, Some(9)).await?;
         let mut scanner = LogReplayScanner::new();
 
         let batches = segment
-            .commit_stream(store.clone(), &log_schema, &Default::default())?
+            .commit_stream(&log_store, &log_schema, &Default::default())?
             .try_collect::<Vec<_>>()
             .await?;
         let batch = concat_batches(&batches[0].schema(), &batches)?;
@@ -643,13 +648,10 @@ pub(super) mod tests {
         let filtered = scanner.process_files_batch(&batch, true)?;
         assert_eq!(filtered.schema().fields().len(), 1);
 
-        let store = context
-            .table_builder(TestTables::Simple)
-            .build_storage()?
-            .object_store(None);
-        let segment = LogSegment::try_new(&Path::default(), None, store.as_ref()).await?;
+        let log_store = TestTables::Simple.table_builder().build_storage()?;
+        let segment = LogSegment::try_new(&log_store, None).await?;
         let batches = segment
-            .commit_stream(store.clone(), &log_schema, &Default::default())?
+            .commit_stream(&log_store, &log_schema, &Default::default())?
             .try_collect::<Vec<_>>()
             .await?;
 
@@ -686,7 +688,7 @@ pub(super) mod tests {
             app_metadata: Default::default(),
             app_transactions: Default::default(),
         };
-        let (_, maybe_batches) = LogSegment::new_test(&[commit_data])?;
+        let (_, maybe_batches) = LogSegment::new_test(&[commit_data], &Path::default())?;
 
         let batches = maybe_batches.into_iter().collect::<Result<Vec<_>, _>>()?;
         let batch = concat_batches(&batches[0].schema(), &batches)?;
@@ -694,16 +696,20 @@ pub(super) mod tests {
         assert!(ex::extract_and_cast_opt::<StringArray>(&batch, "add.stats").is_some());
         assert!(ex::extract_and_cast_opt::<StructArray>(&batch, "add.stats_parsed").is_none());
 
-        let stats_schema = stats_schema(schema, table_config)?;
-        let new_batch = parse_stats(batch, Arc::new((&stats_schema).try_into()?), &config)?;
+        let stats_schema = stats_schema_from_config(schema, table_config)?;
+        let new_batch = parse_stats(
+            batch,
+            Arc::new(stats_schema.as_ref().try_into_arrow()?),
+            &config,
+        )?;
 
         assert!(ex::extract_and_cast_opt::<StructArray>(&new_batch, "add.stats_parsed").is_some());
         let parsed_col = ex::extract_and_cast::<StructArray>(&new_batch, "add.stats_parsed")?;
-        let delta_type: DataType = parsed_col.data_type().try_into()?;
+        let delta_type: DataType = parsed_col.data_type().try_into_kernel()?;
 
         match delta_type {
             DataType::Struct(fields) => {
-                assert_eq!(fields.as_ref(), &stats_schema);
+                assert_eq!(fields.as_ref(), stats_schema.as_ref());
             }
             _ => panic!("unexpected data type"),
         }
@@ -749,7 +755,7 @@ pub(super) mod tests {
             app_metadata: Default::default(),
             app_transactions: Default::default(),
         };
-        let (_, maybe_batches) = LogSegment::new_test(&[commit_data])?;
+        let (_, maybe_batches) = LogSegment::new_test(&[commit_data], &Path::default())?;
 
         let batches = maybe_batches.into_iter().collect::<Result<Vec<_>, _>>()?;
         let batch = concat_batches(&batches[0].schema(), &batches)?;
@@ -768,7 +774,7 @@ pub(super) mod tests {
         );
         let parsed_col =
             ex::extract_and_cast::<StructArray>(&new_batch, "add.partitionValues_parsed")?;
-        let delta_type: DataType = parsed_col.data_type().try_into()?;
+        let delta_type: DataType = parsed_col.data_type().try_into_kernel()?;
 
         match delta_type {
             DataType::Struct(fields) => {

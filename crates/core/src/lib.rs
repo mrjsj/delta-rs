@@ -49,9 +49,10 @@
 //! Querying from local filesystem:
 //! ```
 //! use std::sync::Arc;
-//! use datafusion::prelude::SessionContext;
 //!
+//! # #[cfg(feature="datafusion")]
 //! async {
+//!   use datafusion::prelude::SessionContext;
 //!   let mut ctx = SessionContext::new();
 //!   let table = deltalake_core::open_table("../test/tests/data/simple_table")
 //!       .await
@@ -74,10 +75,10 @@ pub mod kernel;
 pub mod logstore;
 pub mod operations;
 pub mod protocol;
-pub mod schema;
+pub use kernel::schema;
 pub mod table;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "integration_test"))]
 pub mod test_utils;
 
 #[cfg(feature = "datafusion")]
@@ -191,9 +192,9 @@ mod tests {
         let table = crate::open_table("../test/tests/data/delta-0.2.0")
             .await
             .unwrap();
-        assert_eq!(table.version(), 3);
-        assert_eq!(table.protocol().unwrap().min_writer_version, 2);
-        assert_eq!(table.protocol().unwrap().min_reader_version, 1);
+        assert_eq!(table.version(), Some(3));
+        assert_eq!(table.protocol().unwrap().min_writer_version(), 2);
+        assert_eq!(table.protocol().unwrap().min_reader_version(), 1);
         assert_eq!(
             table.get_files_iter().unwrap().collect_vec(),
             vec![
@@ -205,7 +206,7 @@ mod tests {
         let tombstones = table
             .snapshot()
             .unwrap()
-            .all_tombstones(table.object_store().clone())
+            .all_tombstones(&table.log_store())
             .await
             .unwrap()
             .collect_vec();
@@ -244,9 +245,9 @@ mod tests {
         let mut table = crate::open_table_with_version("../test/tests/data/delta-0.2.0", 0)
             .await
             .unwrap();
-        assert_eq!(table.version(), 0);
-        assert_eq!(table.protocol().unwrap().min_writer_version, 2);
-        assert_eq!(table.protocol().unwrap().min_reader_version, 1);
+        assert_eq!(table.version(), Some(0));
+        assert_eq!(table.protocol().unwrap().min_writer_version(), 2);
+        assert_eq!(table.protocol().unwrap().min_reader_version(), 1);
         assert_eq!(
             table.get_files_iter().unwrap().collect_vec(),
             vec![
@@ -258,9 +259,9 @@ mod tests {
         table = crate::open_table_with_version("../test/tests/data/delta-0.2.0", 2)
             .await
             .unwrap();
-        assert_eq!(table.version(), 2);
-        assert_eq!(table.protocol().unwrap().min_writer_version, 2);
-        assert_eq!(table.protocol().unwrap().min_reader_version, 1);
+        assert_eq!(table.version(), Some(2));
+        assert_eq!(table.protocol().unwrap().min_writer_version(), 2);
+        assert_eq!(table.protocol().unwrap().min_reader_version(), 1);
         assert_eq!(
             table.get_files_iter().unwrap().collect_vec(),
             vec![
@@ -272,9 +273,9 @@ mod tests {
         table = crate::open_table_with_version("../test/tests/data/delta-0.2.0", 3)
             .await
             .unwrap();
-        assert_eq!(table.version(), 3);
-        assert_eq!(table.protocol().unwrap().min_writer_version, 2);
-        assert_eq!(table.protocol().unwrap().min_reader_version, 1);
+        assert_eq!(table.version(), Some(3));
+        assert_eq!(table.protocol().unwrap().min_writer_version(), 2);
+        assert_eq!(table.protocol().unwrap().min_reader_version(), 1);
         assert_eq!(
             table.get_files_iter().unwrap().collect_vec(),
             vec![
@@ -290,9 +291,9 @@ mod tests {
         let table = crate::open_table("../test/tests/data/delta-0.8.0")
             .await
             .unwrap();
-        assert_eq!(table.version(), 1);
-        assert_eq!(table.protocol().unwrap().min_writer_version, 2);
-        assert_eq!(table.protocol().unwrap().min_reader_version, 1);
+        assert_eq!(table.version(), Some(1));
+        assert_eq!(table.protocol().unwrap().min_writer_version(), 2);
+        assert_eq!(table.protocol().unwrap().min_reader_version(), 1);
         assert_eq!(
             table.get_files_iter().unwrap().collect_vec(),
             vec![
@@ -322,7 +323,7 @@ mod tests {
         let tombstones = table
             .snapshot()
             .unwrap()
-            .all_tombstones(table.object_store().clone())
+            .all_tombstones(&table.log_store())
             .await
             .unwrap()
             .collect_vec();
@@ -346,9 +347,9 @@ mod tests {
         let mut table = crate::open_table("../test/tests/data/delta-0.8.0")
             .await
             .unwrap();
-        assert_eq!(table.version(), 1);
-        assert_eq!(table.protocol().unwrap().min_writer_version, 2);
-        assert_eq!(table.protocol().unwrap().min_reader_version, 1);
+        assert_eq!(table.version(), Some(1));
+        assert_eq!(table.protocol().unwrap().min_writer_version(), 2);
+        assert_eq!(table.protocol().unwrap().min_reader_version(), 1);
         assert_eq!(
             table.get_files_iter().unwrap().collect_vec(),
             vec![
@@ -357,9 +358,9 @@ mod tests {
             ]
         );
         table.load_version(0).await.unwrap();
-        assert_eq!(table.version(), 0);
-        assert_eq!(table.protocol().unwrap().min_writer_version, 2);
-        assert_eq!(table.protocol().unwrap().min_reader_version, 1);
+        assert_eq!(table.version(), Some(0));
+        assert_eq!(table.protocol().unwrap().min_writer_version(), 2);
+        assert_eq!(table.protocol().unwrap().min_reader_version(), 1);
         assert_eq!(
             table.get_files_iter().unwrap().collect_vec(),
             vec![
@@ -559,16 +560,16 @@ mod tests {
     async fn test_poll_table_commits() {
         let path = "../test/tests/data/simple_table_with_checkpoint";
         let mut table = crate::open_table_with_version(path, 9).await.unwrap();
-        assert_eq!(table.version(), 9);
+        assert_eq!(table.version(), Some(9));
         let peek = table
             .log_store()
-            .peek_next_commit(table.version())
+            .peek_next_commit(table.version().unwrap())
             .await
             .unwrap();
         assert!(matches!(peek, PeekCommit::New(..)));
 
         if let PeekCommit::New(version, actions) = peek {
-            assert_eq!(table.version(), 9);
+            assert_eq!(table.version(), Some(9));
             assert!(!table.get_files_iter().unwrap().any(|f| f
                 == Path::from(
                     "part-00000-f0e955c5-a1e3-4eec-834e-dcc098fc9005-c000.snappy.parquet"
@@ -579,7 +580,7 @@ mod tests {
 
             table.update_incremental(None).await.unwrap();
 
-            assert_eq!(table.version(), 10);
+            assert_eq!(table.version(), Some(10));
             assert!(table.get_files_iter().unwrap().any(|f| f
                 == Path::from(
                     "part-00000-f0e955c5-a1e3-4eec-834e-dcc098fc9005-c000.snappy.parquet"
@@ -588,7 +589,7 @@ mod tests {
 
         let peek = table
             .log_store()
-            .peek_next_commit(table.version())
+            .peek_next_commit(table.version().unwrap())
             .await
             .unwrap();
         assert!(matches!(peek, PeekCommit::UpToDate));
@@ -598,7 +599,7 @@ mod tests {
     async fn test_read_vacuumed_log() {
         let path = "../test/tests/data/checkpoints_vacuumed";
         let table = crate::open_table(path).await.unwrap();
-        assert_eq!(table.version(), 12);
+        assert_eq!(table.version(), Some(12));
     }
 
     #[tokio::test]
@@ -651,7 +652,7 @@ mod tests {
         let table = crate::open_table("../test/tests/data/simple_table_with_cdc")
             .await
             .unwrap();
-        assert_eq!(table.version(), 2);
+        assert_eq!(table.version(), Some(2));
         assert_eq!(
             table.get_files_iter().unwrap().collect_vec(),
             vec![Path::from(

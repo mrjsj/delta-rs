@@ -2,11 +2,11 @@ use std::collections::HashSet;
 
 use arrow_array::{ArrayRef, BooleanArray};
 use arrow_schema::{DataType as ArrowDataType, SchemaRef as ArrowSchemaRef};
+use datafusion::common::scalar::ScalarValue;
+use datafusion::common::{Column, ToDFSchema};
 use datafusion::execution::context::SessionContext;
+use datafusion::logical_expr::Expr;
 use datafusion::physical_optimizer::pruning::{PruningPredicate, PruningStatistics};
-use datafusion_common::scalar::ScalarValue;
-use datafusion_common::{Column, ToDFSchema};
-use datafusion_expr::Expr;
 
 use crate::delta_datafusion::{get_null_of_arrow_type, to_correct_scalar_value};
 use crate::errors::DeltaResult;
@@ -252,8 +252,9 @@ impl PruningStatistics for DeltaTableState {
 mod tests {
     use std::collections::HashMap;
 
+    use datafusion::logical_expr::{col, lit};
     use datafusion::prelude::SessionContext;
-    use datafusion_expr::{col, lit};
+    use object_store::path::Path;
 
     use super::*;
     use crate::delta_datafusion::{files_matching_predicate, DataFusionMixins};
@@ -269,7 +270,8 @@ mod tests {
 
     #[test]
     fn test_parse_predicate_expression() {
-        let snapshot = DeltaTableState::from_actions(init_table_actions()).unwrap();
+        let snapshot =
+            DeltaTableState::from_actions(init_table_actions(), &Path::default()).unwrap();
         let session = SessionContext::new();
         let state = session.state();
 
@@ -317,7 +319,7 @@ mod tests {
             true,
         )));
 
-        let state = DeltaTableState::from_actions(actions).unwrap();
+        let state = DeltaTableState::from_actions(actions, &Path::default()).unwrap();
         let files = files_matching_predicate(&state.snapshot, &[])
             .unwrap()
             .collect::<Vec<_>>();

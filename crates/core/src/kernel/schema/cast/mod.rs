@@ -9,7 +9,8 @@ use arrow_cast::{cast_with_options, CastOptions};
 use arrow_schema::{ArrowError, DataType, FieldRef, Fields, SchemaRef as ArrowSchemaRef};
 use std::sync::Arc;
 
-pub(crate) mod merge_schema;
+mod merge_schema;
+pub(crate) use merge_schema::*;
 
 use crate::DeltaResult;
 
@@ -19,7 +20,8 @@ fn cast_struct(
     cast_options: &CastOptions,
     add_missing: bool,
 ) -> Result<StructArray, ArrowError> {
-    StructArray::try_new(
+    let num_rows = struct_array.len();
+    StructArray::try_new_with_length(
         fields.to_owned(),
         fields
             .iter()
@@ -41,6 +43,7 @@ fn cast_struct(
             })
             .collect::<Result<Vec<_>, _>>()?,
         struct_array.nulls().map(ToOwned::to_owned),
+        num_rows,
     )
 }
 
@@ -178,11 +181,14 @@ pub fn cast_record_batch(
         ..Default::default()
     };
 
-    let s = StructArray::new(
-        batch.schema().as_ref().to_owned().fields,
-        batch.columns().to_owned(),
-        None,
-    );
+    // Can be simplified with StructArray::try_new_with_length in arrow 55.1
+    let col_arrays = batch.columns().to_owned();
+    let s = if col_arrays.is_empty() {
+        StructArray::new_empty_fields(batch.num_rows(), None)
+    } else {
+        StructArray::new(batch.schema().as_ref().to_owned().fields, col_arrays, None)
+    };
+
     let struct_array = cast_struct(&s, target_schema.fields(), &cast_options, add_missing)?;
 
     Ok(RecordBatch::try_new_with_options(
@@ -198,7 +204,6 @@ mod tests {
     use std::ops::Deref;
     use std::sync::Arc;
 
-    use super::merge_schema::{merge_arrow_schema, merge_delta_struct};
     use arrow::array::types::Int32Type;
     use arrow::array::{
         new_empty_array, new_null_array, Array, ArrayData, ArrayRef, AsArray, Int32Array,
@@ -206,14 +211,16 @@ mod tests {
     };
     use arrow::buffer::{Buffer, NullBuffer};
     use arrow_schema::{DataType, Field, FieldRef, Fields, Schema, SchemaRef};
+    use delta_kernel::engine::arrow_conversion::TryIntoKernel as _;
     use delta_kernel::schema::MetadataValue;
     use itertools::Itertools;
 
+    use super::merge_schema::{merge_arrow_schema, merge_delta_struct};
+    use super::{cast_record_batch, is_cast_required};
     use crate::kernel::{
         ArrayType as DeltaArrayType, DataType as DeltaDataType, StructField as DeltaStructField,
         StructType as DeltaStructType,
     };
-    use crate::operations::cast::{cast_record_batch, is_cast_required};
 
     #[test]
     fn test_merge_arrow_schema_with_dict() {
@@ -230,7 +237,7 @@ mod tests {
 
         let result = merge_arrow_schema(left_schema, right_schema, true).unwrap();
         assert_eq!(result.fields().len(), 1);
-        let delta_type: DeltaDataType = result.fields()[0].data_type().try_into().unwrap();
+        let delta_type: DeltaDataType = result.fields()[0].data_type().try_into_kernel().unwrap();
         assert_eq!(delta_type, DeltaDataType::STRING);
         assert!(result.fields()[0].is_nullable());
     }
@@ -280,7 +287,7 @@ mod tests {
 
         let result = merge_arrow_schema(left_schema, right_schema, true).unwrap();
         assert_eq!(result.fields().len(), 1);
-        let delta_type: DeltaDataType = result.fields()[0].data_type().try_into().unwrap();
+        let delta_type: DeltaDataType = result.fields()[0].data_type().try_into_kernel().unwrap();
         assert_eq!(
             delta_type,
             DeltaDataType::Array(Box::new(DeltaArrayType::new(DeltaDataType::STRING, false)))

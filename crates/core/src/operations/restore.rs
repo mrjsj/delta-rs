@@ -35,7 +35,7 @@ use uuid::Uuid;
 
 use super::{CustomExecuteHandler, Operation};
 use crate::kernel::transaction::{CommitBuilder, CommitProperties, TransactionError};
-use crate::kernel::{Action, Add, Protocol, Remove};
+use crate::kernel::{Action, Add, ProtocolExt as _, ProtocolInner, Remove};
 use crate::logstore::LogStoreRef;
 use crate::protocol::DeltaOperation;
 use crate::table::state::DeltaTableState;
@@ -176,11 +176,15 @@ async fn execute(
     let version = match datetime_to_restore {
         Some(datetime) => {
             table.load_with_datetime(datetime).await?;
-            table.version()
+            table
+                .version()
+                .ok_or_else(|| DeltaTableError::NotInitialized)?
         }
         None => {
             table.load_version(version_to_restore.unwrap()).await?;
-            table.version()
+            table
+                .version()
+                .ok_or_else(|| DeltaTableError::NotInitialized)?
         }
     };
 
@@ -242,32 +246,32 @@ async fn execute(
 
     let mut actions = vec![];
     let protocol = if protocol_downgrade_allowed {
-        Protocol {
-            min_reader_version: table.protocol()?.min_reader_version,
-            min_writer_version: table.protocol()?.min_writer_version,
-            writer_features: if snapshot.protocol().min_writer_version < 7 {
+        ProtocolInner {
+            min_reader_version: table.protocol()?.min_reader_version(),
+            min_writer_version: table.protocol()?.min_writer_version(),
+            writer_features: if snapshot.protocol().min_writer_version() < 7 {
                 None
             } else {
-                table.protocol()?.writer_features.clone()
+                table.protocol()?.writer_features_set()
             },
-            reader_features: if snapshot.protocol().min_reader_version < 3 {
+            reader_features: if snapshot.protocol().min_reader_version() < 3 {
                 None
             } else {
-                table.protocol()?.reader_features.clone()
+                table.protocol()?.reader_features_set()
             },
         }
     } else {
-        Protocol {
+        ProtocolInner {
             min_reader_version: max(
-                table.protocol()?.min_reader_version,
-                snapshot.protocol().min_reader_version,
+                table.protocol()?.min_reader_version(),
+                snapshot.protocol().min_reader_version(),
             ),
             min_writer_version: max(
-                table.protocol()?.min_writer_version,
-                snapshot.protocol().min_writer_version,
+                table.protocol()?.min_writer_version(),
+                snapshot.protocol().min_writer_version(),
             ),
-            writer_features: snapshot.protocol().writer_features.clone(),
-            reader_features: snapshot.protocol().reader_features.clone(),
+            writer_features: snapshot.protocol().writer_features_set(),
+            reader_features: snapshot.protocol().reader_features_set(),
         }
     };
     commit_properties
@@ -278,7 +282,7 @@ async fn execute(
         serde_json::to_value(&metrics)?,
     );
 
-    actions.push(Action::Protocol(protocol));
+    actions.push(Action::Protocol(protocol.as_kernel()));
     actions.extend(files_to_add.into_iter().map(Action::Add));
     actions.extend(files_to_remove.into_iter().map(Action::Remove));
     // Add the metadata from the restored version to undo e.g. constraint or field metadata changes
@@ -375,12 +379,13 @@ mod tests {
     /// Verify that restore respects constraints that were added/removed in previous version_to_restore
     /// <https://github.com/delta-io/delta-rs/issues/3352>
     #[tokio::test]
+    #[cfg(feature = "datafusion")]
     async fn test_simple_restore_constraints() -> DeltaResult<()> {
         let batch = get_record_batch(None, false);
         let table = DeltaOps(create_bare_table())
             .write(vec![batch.clone()])
             .await?;
-        let first_v = table.version();
+        let first_v = table.version().unwrap();
 
         let constraint = DeltaOps(table)
             .add_constraint()
@@ -401,7 +406,7 @@ mod tests {
             .restore()
             .with_version_to_restore(first_v)
             .await?;
-        assert_ne!(table.version(), first_v);
+        assert_ne!(table.version(), Some(first_v));
 
         let constraints = table.state.unwrap().table_config().get_constraints();
         assert!(constraints.is_empty());
